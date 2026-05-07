@@ -102,6 +102,7 @@ type Client struct {
 
 	historySyncNotifications        chan *waE2E.HistorySyncNotification
 	historySyncHandlerStarted       atomic.Bool
+	quitHistorySync                 chan struct{}
 	ManualHistorySyncDownload       bool
 	DisableManualHistorySyncReceipt bool
 
@@ -264,6 +265,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		incomingRetryRequestCounter: make(map[incomingRetryKey]int),
 
 		historySyncNotifications: make(chan *waE2E.HistorySyncNotification, 32),
+		quitHistorySync:          make(chan struct{}),
 
 		tcTokenSenderTS:  make(map[types.JID]time.Time),
 		groupCache:       make(map[types.JID]*groupMetaCache),
@@ -662,6 +664,14 @@ func (cli *Client) Disconnect() {
 	cli.unlockedDisconnect()
 	cli.socketLock.Unlock()
 	cli.clearDelayedMessageRequests()
+	if cli.quitHistorySync != nil {
+		select {
+		case <-cli.quitHistorySync:
+			// 已经关闭，不做任何操作
+		default:
+			close(cli.quitHistorySync)
+		}
+	}
 }
 
 // ResetConnection disconnects from the WhatsApp web websocket and forces an automatic reconnection.
