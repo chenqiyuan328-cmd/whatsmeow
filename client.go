@@ -83,8 +83,6 @@ type Client struct {
 	SynchronousAck             bool
 	EnableDecryptedEventBuffer bool
 	lastDecryptedBufferClear   time.Time
-	lastTcTokenSenderTsCleanup time.Time
-	lastTcTokenDBPrune         time.Time
 
 	DisableLoginAutoReconnect bool
 
@@ -102,10 +100,10 @@ type Client struct {
 	appStateProc     *appstate.Processor
 	appStateSyncLock sync.Mutex
 
-	historySyncNotifications  chan *waE2E.HistorySyncNotification
-	historySyncHandlerStarted atomic.Bool
-	quitHistorySync           chan struct{}
-	ManualHistorySyncDownload bool
+	historySyncNotifications        chan *waE2E.HistorySyncNotification
+	historySyncHandlerStarted       atomic.Bool
+	ManualHistorySyncDownload       bool
+	DisableManualHistorySyncReceipt bool
 
 	uploadPreKeysLock sync.Mutex
 	lastPreKeyUpload  time.Time
@@ -133,9 +131,11 @@ type Client struct {
 
 	messageSendLock sync.Mutex
 
-	tcTokenSenderTs               sync.Map
-	tcTokenSenderTsCleanupStarted atomic.Bool
-	tcTokenDBPruneStarted         atomic.Bool
+	tcTokenSenderTS            map[types.JID]time.Time
+	tcTokenSenderTSLock        sync.Mutex
+	lastTCTokenSenderTSCleanup time.Time
+	tcTokenDBPruneLock         sync.Mutex
+	lastTCTokenDBPrune         time.Time
 
 	privacySettingsCache atomic.Value
 
@@ -264,8 +264,8 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		incomingRetryRequestCounter: make(map[incomingRetryKey]int),
 
 		historySyncNotifications: make(chan *waE2E.HistorySyncNotification, 32),
-		quitHistorySync:          make(chan struct{}),
 
+		tcTokenSenderTS:  make(map[types.JID]time.Time),
 		groupCache:       make(map[types.JID]*groupMetaCache),
 		userDevicesCache: make(map[types.JID]deviceCache),
 
@@ -662,14 +662,6 @@ func (cli *Client) Disconnect() {
 	cli.unlockedDisconnect()
 	cli.socketLock.Unlock()
 	cli.clearDelayedMessageRequests()
-	if cli.quitHistorySync != nil {
-		select {
-		case <-cli.quitHistorySync:
-			// 已经关闭，不做任何操作
-		default:
-			close(cli.quitHistorySync)
-		}
-	}
 }
 
 // ResetConnection disconnects from the WhatsApp web websocket and forces an automatic reconnection.

@@ -17,28 +17,44 @@ import (
 
 const (
 	// tcTokenBucketDuration is the duration of a single bucket in seconds (7 days).
-	// Matches WA Web AB prop tctoken_duration.
+	// Matches AB prop tctoken_duration.
 	tcTokenBucketDuration = 604800
 	// tcTokenNumBuckets is the number of rolling buckets (4 = ~28-day window).
-	// Matches WA Web AB prop tctoken_num_buckets.
+	// Matches AB prop tctoken_num_buckets.
 	tcTokenNumBuckets      = 4
 	tcTokenDBPruneInterval = 24 * time.Hour
 )
 
-func tcTokenCutoffTimestamp(now int64) int64 {
-	currentBucket := now / tcTokenBucketDuration
+func currentTCTokenCutoffTimestamp() time.Time {
+	currentBucket := time.Now().Unix() / tcTokenBucketDuration
 	cutoffBucket := currentBucket - (tcTokenNumBuckets - 1)
-	return cutoffBucket * tcTokenBucketDuration
+	return time.Unix(cutoffBucket*tcTokenBucketDuration, 0)
 }
 
-func isTcTokenExpired(timestamp time.Time) bool {
+func isTCTokenExpired(timestamp time.Time) bool {
 	if timestamp.IsZero() {
 		return true
 	}
-	return timestamp.Unix() < tcTokenCutoffTimestamp(time.Now().Unix())
+	return timestamp.Before(currentTCTokenCutoffTimestamp())
 }
 
-func (cli *Client) resolveTcTokenStorageLID(ctx context.Context, jid types.JID) types.JID {
+// shouldSendNewTCToken returns true when the current bucket is newer than the last issuance bucket.
+func shouldSendNewTCToken(senderTimestamp time.Time) bool {
+	if senderTimestamp.IsZero() {
+		return true
+	}
+	now := time.Now().Unix()
+	return now/tcTokenBucketDuration > senderTimestamp.Unix()/tcTokenBucketDuration
+}
+
+func shouldSendTCTokenInChatAction(jid types.JID) bool {
+	jid = jid.ToNonAD()
+	return (jid.Server == types.DefaultUserServer || jid.Server == types.HiddenUserServer) &&
+		jid.User != types.PSAJID.User &&
+		!jid.IsBot()
+}
+
+func (cli *Client) resolveTCTokenStorageLID(ctx context.Context, jid types.JID) types.JID {
 	storageJID := jid.ToNonAD()
 	if storageJID.Server != types.DefaultUserServer || cli.Store == nil || cli.Store.LIDs == nil {
 		return storageJID
@@ -54,99 +70,117 @@ func (cli *Client) resolveTcTokenStorageLID(ctx context.Context, jid types.JID) 
 	return lid.ToNonAD()
 }
 
-func (cli *Client) hasValidTcTokenSenderTs(jid types.JID, storedSenderTimestamp time.Time) bool {
+// getTCTokenSenderTS reads the in-memory sender timestamp for a JID.
+func (cli *Client) getTCTokenSenderTS(jid types.JID) time.Time {
+	cli.tcTokenSenderTSLock.Lock()
+	defer cli.tcTokenSenderTSLock.Unlock()
+
+	return cli.tcTokenSenderTS[jid.ToNonAD()]
+}
+
+func (cli *Client) validateAndSetTCTokenSenderTS(jid types.JID, storedSenderTimestamp time.Time) bool {
+	cli.tcTokenSenderTSLock.Lock()
+	defer cli.tcTokenSenderTSLock.Unlock()
+
 	key := jid.ToNonAD()
-	if _, ok := cli.tcTokenSenderTs.Load(key); ok {
+	if _, ok := cli.tcTokenSenderTS[key]; ok {
 		return true
 	}
-	now := time.Now()
-	if storedSenderTimestamp.IsZero() || storedSenderTimestamp.Unix() < tcTokenCutoffTimestamp(now.Unix()) {
+	if storedSenderTimestamp.IsZero() || storedSenderTimestamp.Before(currentTCTokenCutoffTimestamp()) {
 		return false
 	}
-	// Hydrate from DB — this is a write, so sweep here
-	cli.tcTokenSenderTs.Store(key, storedSenderTimestamp)
-	cli.cleanupTcTokenSenderTsMapIfDue(now)
+	cli.tcTokenSenderTS[key] = storedSenderTimestamp
+	cli.unlockedCleanupTCTokenSenderTSMap()
 	return true
 }
 
-// shouldSendNewTcToken returns true when the current bucket is newer than the last issuance bucket.
-func shouldSendNewTcToken(senderTimestamp time.Time) bool {
-	if senderTimestamp.IsZero() {
-		return true
-	}
-	now := time.Now().Unix()
-	return now/tcTokenBucketDuration > senderTimestamp.Unix()/tcTokenBucketDuration
+// setTCTokenSenderTS writes the in-memory sender timestamp for a JID.
+func (cli *Client) setTCTokenSenderTS(jid types.JID, ts time.Time) {
+	cli.tcTokenSenderTSLock.Lock()
+	defer cli.tcTokenSenderTSLock.Unlock()
+
+	cli.tcTokenSenderTS[jid.ToNonAD()] = ts
+	cli.unlockedCleanupTCTokenSenderTSMap()
 }
 
-func shouldSendTcTokenInChatAction(jid types.JID) bool {
-	jid = jid.ToNonAD()
-	return (jid.Server == types.DefaultUserServer || jid.Server == types.HiddenUserServer) &&
-		jid.User != types.PSAJID.User &&
-		!jid.IsBot()
-}
-
-// getTcTokenSenderTs reads the in-memory sender timestamp for a JID.
-func (cli *Client) getTcTokenSenderTs(jid types.JID) time.Time {
-	if v, ok := cli.tcTokenSenderTs.Load(jid.ToNonAD()); ok {
-		return v.(time.Time)
-	}
-	return time.Time{}
-}
-
-// setTcTokenSenderTs writes the in-memory sender timestamp for a JID.
-func (cli *Client) setTcTokenSenderTs(jid types.JID, ts time.Time) {
-	cli.tcTokenSenderTs.Store(jid.ToNonAD(), ts)
-	cli.cleanupTcTokenSenderTsMapIfDue(time.Now())
-}
-
-func (cli *Client) cleanupTcTokenSenderTsMapIfDue(now time.Time) {
-	if !cli.tcTokenSenderTsCleanupStarted.CompareAndSwap(false, true) {
+func (cli *Client) unlockedCleanupTCTokenSenderTSMap() {
+	if time.Since(cli.lastTCTokenSenderTSCleanup) < tcTokenBucketDuration*time.Second {
 		return
 	}
-	defer cli.tcTokenSenderTsCleanupStarted.Store(false)
-	if now.Sub(cli.lastTcTokenSenderTsCleanup) < tcTokenBucketDuration*time.Second {
-		return
-	}
-	cli.lastTcTokenSenderTsCleanup = now
-	nowUnix := now.Unix()
-	cutoffTimestamp := tcTokenCutoffTimestamp(nowUnix)
-	cli.tcTokenSenderTs.Range(func(key, value any) bool {
-		ts, ok := value.(time.Time)
-		if !ok || ts.Unix() < cutoffTimestamp {
-			cli.tcTokenSenderTs.Delete(key)
+	cli.lastTCTokenSenderTSCleanup = time.Now()
+	cutoffTimestamp := currentTCTokenCutoffTimestamp()
+	for jid, ts := range cli.tcTokenSenderTS {
+		if ts.Before(cutoffTimestamp) {
+			delete(cli.tcTokenSenderTS, jid)
 		}
-		return true
-	})
+	}
 }
 
-func (cli *Client) cleanupExpiredTcTokensFromDBIfDue(ctx context.Context) {
-	if ctx.Err() != nil {
+// ensureTCToken returns a stored non-expired tctoken for the given JID, if available.
+func (cli *Client) ensureTCToken(ctx context.Context, jid types.JID) (token []byte, err error) {
+	cli.deleteExpiredPrivacyTokens()
+	storageJID := cli.resolveTCTokenStorageLID(ctx, jid)
+	existing, err := cli.Store.PrivacyTokens.GetPrivacyToken(ctx, storageJID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get privacy token: %w", err)
+	}
+	if existing == nil {
+		return nil, nil
+	}
+	cli.validateAndSetTCTokenSenderTS(storageJID, existing.SenderTimestamp)
+	if len(existing.Token) > 0 && !isTCTokenExpired(existing.Timestamp) {
+		return existing.Token, nil
+	}
+	return nil, nil
+}
+
+func (cli *Client) deleteExpiredPrivacyTokens() {
+	if !cli.tcTokenDBPruneLock.TryLock() {
 		return
 	}
-	if !cli.tcTokenDBPruneStarted.CompareAndSwap(false, true) {
+	if time.Since(cli.lastTCTokenDBPrune) < tcTokenDBPruneInterval {
+		cli.tcTokenDBPruneLock.Unlock()
 		return
 	}
-	now := time.Now()
-	if now.Sub(cli.lastTcTokenDBPrune) < tcTokenDBPruneInterval {
-		cli.tcTokenDBPruneStarted.Store(false)
-		return
-	}
-	cli.lastTcTokenDBPrune = now
+	cli.lastTCTokenDBPrune = time.Now()
 	go func() {
-		defer cli.tcTokenDBPruneStarted.Store(false)
-		cutoff := time.Unix(tcTokenCutoffTimestamp(time.Now().Unix()), 0)
-		deleted, err := cli.Store.PrivacyTokens.DeleteExpiredPrivacyTokens(context.WithoutCancel(ctx), cutoff)
+		defer cli.tcTokenDBPruneLock.Unlock()
+		deleted, err := cli.Store.PrivacyTokens.DeleteExpiredPrivacyTokens(cli.BackgroundEventCtx, currentTCTokenCutoffTimestamp())
 		if err != nil {
-			cli.Log.Warnf("Failed to clean expired tctokens from DB: %v", err)
+			cli.Log.Warnf("Failed to remove expired tctokens from DB: %v", err)
 		} else if deleted > 0 {
-			cli.Log.Debugf("Cleaned %d expired tctokens from DB", deleted)
+			cli.Log.Debugf("Removed %d expired tctokens from DB", deleted)
 		}
 	}()
 }
 
+// Only called when a bucket boundary has been crossed since the last issuance.
+func (cli *Client) issuePrivacyTokenAndSave(jid types.JID, senderTimestamp time.Time) {
+	ctx := cli.BackgroundEventCtx
+	storageJID := jid.ToNonAD()
+	_, err := cli.issuePrivacyToken(ctx, storageJID, senderTimestamp)
+	if err != nil {
+		cli.Log.Errorf("Failed to issue privacy token for %s: %v", jid, err)
+		return
+	}
+	cli.setTCTokenSenderTS(storageJID, senderTimestamp)
+	// TODO replace with an UPDATE call instead of get+put
+	existing, err := cli.Store.PrivacyTokens.GetPrivacyToken(ctx, storageJID)
+	if err != nil {
+		cli.Log.Errorf("Failed to load tctoken while persisting sender timestamp for %s: %v", jid, err)
+		return
+	}
+	if existing == nil || len(existing.Token) == 0 {
+		return
+	}
+	existing.SenderTimestamp = senderTimestamp
+	if err = cli.Store.PrivacyTokens.PutPrivacyTokens(ctx, *existing); err != nil {
+		cli.Log.Errorf("Failed to persist privacy token sender timestamp for %s: %v", jid, err)
+	}
+}
+
 // issuePrivacyToken sends an IQ to the server to issue a privacy token for the given JID.
-// Matches WAWebSetPrivacyTokensJob.issuePrivacyToken(targetJID, tokenTypes, timestamp).
-func (cli *Client) issuePrivacyToken(ctx context.Context, jid types.JID, timestamp int64) (*waBinary.Node, error) {
+func (cli *Client) issuePrivacyToken(ctx context.Context, jid types.JID, timestamp time.Time) (*waBinary.Node, error) {
 	return cli.sendIQ(ctx, infoQuery{
 		Namespace: "privacy",
 		Type:      iqSet,
@@ -157,54 +191,10 @@ func (cli *Client) issuePrivacyToken(ctx context.Context, jid types.JID, timesta
 				Tag: "token",
 				Attrs: waBinary.Attrs{
 					"jid":  jid.ToNonAD(),
-					"t":    fmt.Sprintf("%d", timestamp),
+					"t":    fmt.Sprintf("%d", timestamp.Unix()),
 					"type": "trusted_contact",
 				},
 			}},
 		}},
 	})
-}
-
-// ensureTcToken returns a stored non-expired tctoken for the given JID, if available.
-func (cli *Client) ensureTcToken(ctx context.Context, jid types.JID) (token []byte, err error) {
-	cli.cleanupExpiredTcTokensFromDBIfDue(ctx)
-	storageJID := cli.resolveTcTokenStorageLID(ctx, jid)
-	existing, err := cli.Store.PrivacyTokens.GetPrivacyToken(ctx, storageJID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get privacy token: %w", err)
-	}
-	if existing == nil {
-		return nil, nil
-	}
-	cli.hasValidTcTokenSenderTs(storageJID, existing.SenderTimestamp)
-	if len(existing.Token) > 0 && !isTcTokenExpired(existing.Timestamp) {
-		return existing.Token, nil
-	}
-	return nil, nil
-}
-
-// Only called when a bucket boundary has been crossed since the last issuance.
-func (cli *Client) fireAndForgetTcTokenIssuance(ctx context.Context, jid types.JID, issueTimestamp int64) {
-	go func(ctx context.Context) {
-		storageJID := jid.ToNonAD()
-		_, err := cli.issuePrivacyToken(ctx, storageJID, issueTimestamp)
-		if err != nil {
-			cli.Log.Debugf("Fire-and-forget tctoken issuance failed for %s: %v", jid, err)
-			return
-		}
-		senderTimestamp := time.Unix(issueTimestamp, 0)
-		cli.setTcTokenSenderTs(storageJID, senderTimestamp)
-		existing, err := cli.Store.PrivacyTokens.GetPrivacyToken(ctx, storageJID)
-		if err != nil {
-			cli.Log.Debugf("Failed to load tctoken while persisting sender timestamp for %s: %v", jid, err)
-			return
-		}
-		if existing == nil || len(existing.Token) == 0 {
-			return
-		}
-		existing.SenderTimestamp = senderTimestamp
-		if err = cli.Store.PrivacyTokens.PutPrivacyTokens(ctx, *existing); err != nil {
-			cli.Log.Debugf("Failed to persist fire-and-forget sender timestamp for %s: %v", jid, err)
-		}
-	}(context.WithoutCancel(ctx))
 }

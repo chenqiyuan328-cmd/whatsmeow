@@ -867,7 +867,7 @@ func (cli *Client) sendDM(
 		node.Content = append(node.GetChildren(), cli.getMessageReportingToken(messagePlaintext, message, ownID, to, id))
 	}
 
-	tcTokenBytes, tcErr := cli.ensureTcToken(ctx, to)
+	tcTokenBytes, tcErr := cli.ensureTCToken(ctx, to)
 	if tcErr != nil {
 		cli.Log.Warnf("Failed to get privacy token for %s: %v", to, tcErr)
 	}
@@ -875,6 +875,11 @@ func (cli *Client) sendDM(
 		node.Content = append(node.GetChildren(), waBinary.Node{
 			Tag:     "tctoken",
 			Content: tcTokenBytes,
+		})
+	} else if csToken := cli.generateCsToken(ctx, to); len(csToken) > 0 {
+		node.Content = append(node.GetChildren(), waBinary.Node{
+			Tag:     "cstoken",
+			Content: csToken,
 		})
 	}
 
@@ -885,9 +890,9 @@ func (cli *Client) sendDM(
 		return "", nil, fmt.Errorf("failed to send message node: %w", err)
 	}
 
-	storageJID := cli.resolveTcTokenStorageLID(ctx, to)
-	if shouldSendTcTokenInChatAction(to) && shouldSendNewTcToken(cli.getTcTokenSenderTs(storageJID)) {
-		cli.fireAndForgetTcTokenIssuance(ctx, storageJID, time.Now().Unix())
+	storageJID := cli.resolveTCTokenStorageLID(ctx, to)
+	if shouldSendTCTokenInChatAction(to) && shouldSendNewTCToken(cli.getTCTokenSenderTS(storageJID)) {
+		go cli.issuePrivacyTokenAndSave(storageJID, time.Now())
 	}
 
 	return phash, data, nil
@@ -1041,6 +1046,8 @@ func getEditAttribute(msg *waE2E.Message) types.EditAttribute {
 		return types.EditAttributeSenderRevoke
 	case msg.KeepInChatMessage != nil && msg.KeepInChatMessage.GetKey().GetFromMe() && msg.KeepInChatMessage.GetKeepType() == waE2E.KeepType_UNDO_KEEP_FOR_ALL:
 		return types.EditAttributeSenderRevoke
+	case msg.PinInChatMessage != nil:
+		return types.EditAttributePinInChat
 	}
 	return types.EditAttributeEmpty
 }
