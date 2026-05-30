@@ -9,11 +9,6 @@ require (
 	github.com/coder/websocket v1.8.14
 	github.com/google/uuid v1.6.0
 	github.com/refraction-networking/utls v1.8.1
-	github.com/rs/zerolog v1.35.0
-	go.mau.fi/libsignal v0.2.1
-	go.mau.fi/util v0.9.8
-	golang.org/x/crypto v0.50.0
-	golang.org/x/net v0.53.0
 	github.com/rs/zerolog v1.35.1
 	go.mau.fi/libsignal v0.2.2
 	go.mau.fi/util v0.9.9
@@ -25,7 +20,6 @@ require (
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
-	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/andybalholm/brotli v1.0.6 // indirect
 	github.com/elliotchance/orderedmap/v3 v3.1.0 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
