@@ -16,6 +16,19 @@ discussions.
 The [godoc](https://pkg.go.dev/go.mau.fi/whatsmeow) includes docs for all methods and event types.
 There's also a [simple example](https://pkg.go.dev/go.mau.fi/whatsmeow#example-package) at the top.
 
+### uTLS proxy (Chrome ClientHello fingerprint)
+
+You can route outbound TLS through an upstream proxy while using uTLS to mimic a real browser ClientHello:
+
+```go
+err := client.SetUTLSProxyAddress("socks5://127.0.0.1:1080", whatsmeow.UTLSClientHelloChromeAuto)
+if err != nil {
+	panic(err)
+}
+```
+
+Supported proxy schemes are `http`, `https`, and `socks5`.
+
 ## Features
 Most core features are already present:
 
