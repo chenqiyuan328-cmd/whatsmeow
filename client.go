@@ -172,6 +172,7 @@ type Client struct {
 	// GetClientPayload is called to get the client payload for connecting to the server.
 	// This should NOT be used for WhatsApp (to change the OS name, update fields in store.BaseClientPayload directly).
 	GetClientPayload func() *waWa6.ClientPayload
+	QRClientType     PairClientType
 
 	// Should untrusted identity errors be handled automatically? If true, the stored identity and existing signal
 	// sessions will be removed on untrusted identity errors, and an events.IdentityChange will be dispatched.
@@ -870,12 +871,12 @@ Loop:
 	for {
 		select {
 		case node := <-cli.handlerQueue:
-			doneChan := make(chan struct{}, 1)
+			doneChan := make(chan struct{})
 			start := time.Now()
 			go func() {
 				cli.nodeHandlers[node.Tag](evtCtx, node)
 				duration := time.Since(start)
-				doneChan <- struct{}{}
+				close(doneChan)
 				if duration > 5*time.Second {
 					cli.Log.Warnf("Node handling took %s for %s", duration, node.XMLString())
 				}

@@ -426,6 +426,10 @@ message LabelEditAction {
 		AI_HANDOFF = 9;
 		CHANNELS = 10;
 		AI_RESPONDING = 11;
+		ARCHIVED = 12;
+		LOCKED = 13;
+		INVITES = 14;
+		THIRD_PARTY = 15;
 	}
 
 	optional string name = 1;
@@ -972,8 +976,15 @@ message RecentEmojiWeightsAction {
 	repeated RecentEmojiWeight weights = 1;
 }
 
+message ModelMetadata {
+	optional string modelName = 1;
+	optional bool isLatestModel = 2;
+	optional bool isDetected = 3;
+}
+
 message LabelAssociationAction {
 	optional bool labeled = 1;
+	repeated ModelMetadata modelMetaData = 2;
 }
 
 message QuickReplyAction {
