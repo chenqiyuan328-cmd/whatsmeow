@@ -31,12 +31,11 @@ type FrameSocket struct {
 	HTTPHeaders http.Header
 	HTTPClient  *http.Client
 
-	Frames       chan []byte
-	OnDisconnect func(ctx context.Context, remote bool)
-
+	Frames chan []byte
 	Header []byte
 
-	closed atomic.Bool
+	onDisconnect atomic.Pointer[func(ctx context.Context, remote bool)]
+	closed       atomic.Bool
 
 	incomingLength int
 	receivedLength int
@@ -50,9 +49,13 @@ func NewFrameSocket(log waLog.Logger, client *http.Client) *FrameSocket {
 		Header: WAConnHeader,
 		Frames: make(chan []byte),
 
-		URL:         URL,
-		HTTPHeaders: http.Header{"Origin": {Origin}},
-		HTTPClient:  client,
+		URL: URL,
+		HTTPHeaders: http.Header{
+			"Origin":        {Origin},
+			"Cache-Control": {"no-cache"},
+			"Pragma":        {"no-cache"},
+		},
+		HTTPClient: client,
 	}
 }
 
@@ -83,8 +86,8 @@ func (fs *FrameSocket) Close(code websocket.StatusCode) {
 	}
 	fs.cancel()
 	fs.cancel = nil
-	if fs.OnDisconnect != nil {
-		go fs.OnDisconnect(fs.parentCtx, code == 0)
+	if onDisconnect := fs.onDisconnect.Swap(nil); onDisconnect != nil {
+		go (*onDisconnect)(fs.parentCtx, code == 0)
 	}
 }
 
@@ -170,8 +173,8 @@ func (fs *FrameSocket) processData(msg []byte) {
 			if len(msg) >= FrameLengthSize {
 				length := (int(msg[0]) << 16) + (int(msg[1]) << 8) + int(msg[2])
 				fs.incomingLength = length
-				fs.receivedLength = len(msg)
 				msg = msg[FrameLengthSize:]
+				fs.receivedLength = len(msg)
 				if len(msg) >= length {
 					fs.incoming = msg[:length]
 					msg = msg[length:]

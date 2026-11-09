@@ -123,6 +123,10 @@ func (int *DangerousInternalClient) GetOwnLID() types.JID {
 	return int.c.getOwnLID()
 }
 
+func (int *DangerousInternalClient) GetUserAgent() string {
+	return int.c.getUserAgent()
+}
+
 func (int *DangerousInternalClient) Connect(ctx context.Context) error {
 	return int.c.connect(ctx)
 }
@@ -155,12 +159,16 @@ func (int *DangerousInternalClient) UnlockedDisconnect() {
 	int.c.unlockedDisconnect()
 }
 
-func (int *DangerousInternalClient) HandleFrame(ctx context.Context, data []byte) {
-	int.c.handleFrame(ctx, data)
+func (int *DangerousInternalClient) MakeFrameHandler(queue chan *waBinary.Node) func(context.Context, []byte) {
+	return int.c.makeFrameHandler(queue)
 }
 
-func (int *DangerousInternalClient) HandlerQueueLoop(evtCtx, connCtx context.Context) {
-	int.c.handlerQueueLoop(evtCtx, connCtx)
+func (int *DangerousInternalClient) HandleFrame(ctx context.Context, data []byte, queue chan *waBinary.Node) {
+	int.c.handleFrame(ctx, data, queue)
+}
+
+func (int *DangerousInternalClient) HandlerQueueLoop(evtCtx, connCtx context.Context, queue chan *waBinary.Node, closeWait chan struct{}) {
+	int.c.handlerQueueLoop(evtCtx, connCtx, queue, closeWait)
 }
 
 func (int *DangerousInternalClient) SendNodeAndGetData(ctx context.Context, node waBinary.Node) ([]byte, error) {
@@ -179,8 +187,8 @@ func (int *DangerousInternalClient) GetUnifiedSessionID() string {
 	return int.c.getUnifiedSessionID()
 }
 
-func (int *DangerousInternalClient) SendUnifiedSession() {
-	int.c.sendUnifiedSession()
+func (int *DangerousInternalClient) SendUnifiedSession(checkLastSend bool) {
+	int.c.sendUnifiedSession(checkLastSend)
 }
 
 func (int *DangerousInternalClient) HandleStreamError(ctx context.Context, node *waBinary.Node) {
@@ -283,8 +291,8 @@ func (int *DangerousInternalClient) ParseGroupNotification(node *waBinary.Node) 
 	return int.c.parseGroupNotification(node)
 }
 
-func (int *DangerousInternalClient) DoHandshake(ctx context.Context, fs *socket.FrameSocket, ephemeralKP keys.KeyPair) error {
-	return int.c.doHandshake(ctx, fs, ephemeralKP)
+func (int *DangerousInternalClient) DoHandshake(fs *socket.FrameSocket, ephemeralKP keys.KeyPair) (chan *waBinary.Node, error) {
+	return int.c.doHandshake(fs, ephemeralKP)
 }
 
 func (int *DangerousInternalClient) KeepAliveLoop(ctx, connCtx context.Context) {
@@ -399,12 +407,20 @@ func (int *DangerousInternalClient) StoreGlobalSettings(ctx context.Context, set
 	int.c.storeGlobalSettings(ctx, settings)
 }
 
+func (int *DangerousInternalClient) StoreCompanionMetaNonce(ctx context.Context, nonce string) {
+	int.c.storeCompanionMetaNonce(ctx, nonce)
+}
+
 func (int *DangerousInternalClient) StoreHistoricalPNLIDMappings(ctx context.Context, mappings []*waHistorySync.PhoneNumberToLIDMapping) {
 	int.c.storeHistoricalPNLIDMappings(ctx, mappings)
 }
 
 func (int *DangerousInternalClient) HandleDecryptedMessage(ctx context.Context, info *types.MessageInfo, msg *waE2E.Message, retryCount int) (handlerFailed bool) {
 	return int.c.handleDecryptedMessage(ctx, info, msg, retryCount)
+}
+
+func (int *DangerousInternalClient) EncryptWASAMessage(ctx context.Context, bot types.JID, id types.MessageID, msg *waE2E.Message) ([]byte, error) {
+	return int.c.encryptWASAMessage(ctx, bot, id, msg)
 }
 
 func (int *DangerousInternalClient) DecryptMsgSecret(ctx context.Context, msg *events.Message, useCase MsgSecretType, encrypted messageEncryptedSecret, origMsgKey *waCommon.MessageKey) ([]byte, error) {
@@ -497,6 +513,10 @@ func (int *DangerousInternalClient) HandleIQ(ctx context.Context, node *waBinary
 
 func (int *DangerousInternalClient) HandlePairDevice(ctx context.Context, node *waBinary.Node) {
 	int.c.handlePairDevice(ctx, node)
+}
+
+func (int *DangerousInternalClient) RotateADVSecret(ctx context.Context) {
+	int.c.rotateADVSecret(ctx)
 }
 
 func (int *DangerousInternalClient) GetQRClientType() PairClientType {
@@ -823,6 +843,6 @@ func (int *DangerousInternalClient) Usync(ctx context.Context, jids []types.JID,
 	return int.c.usync(ctx, jids, mode, context, query, extra...)
 }
 
-func (int *DangerousInternalClient) ParseBlocklist(node *waBinary.Node) *types.Blocklist {
+func (int *DangerousInternalClient) ParseBlocklist(node *waBinary.Node) (*types.Blocklist, []store.LIDMapping) {
 	return int.c.parseBlocklist(node)
 }

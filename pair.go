@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"go.mau.fi/libsignal/ecc"
+	"go.mau.fi/util/random"
 	"google.golang.org/protobuf/proto"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -80,6 +81,15 @@ func (cli *Client) handlePairDevice(ctx context.Context, node *waBinary.Node) {
 	cli.dispatchEvent(evt)
 }
 
+func (cli *Client) rotateADVSecret(ctx context.Context) {
+	oldSecret := cli.Store.AdvSecretKey
+	cli.Store.AdvSecretKey = random.Bytes(32)
+	cli.dispatchEvent(&events.RotateADVSecret{
+		OldSecret: base64.StdEncoding.EncodeToString(oldSecret),
+		NewSecret: base64.StdEncoding.EncodeToString(cli.Store.AdvSecretKey),
+	})
+}
+
 func (cli *Client) getQRClientType() PairClientType {
 	if cli.QRClientType != "" {
 		return cli.QRClientType
@@ -143,7 +153,7 @@ func (cli *Client) handlePairSuccess(ctx context.Context, node *waBinary.Node) {
 			cli.dispatchEvent(&events.PairError{ID: jid, LID: lid, BusinessName: businessName, Platform: platform, Props: &props, Error: err})
 		} else {
 			cli.Log.Infof("Successfully paired %s", cli.Store.ID)
-			go cli.sendUnifiedSession()
+			go cli.sendUnifiedSession(false)
 			cli.dispatchEvent(&events.PairSuccess{ID: jid, LID: lid, BusinessName: businessName, Platform: platform, Props: &props})
 		}
 	}()

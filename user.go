@@ -157,20 +157,17 @@ func (cli *Client) GetContactQRLink(ctx context.Context, revoke bool) (string, e
 	return ag.String("code"), ag.Error()
 }
 
+const mutationUpdateTextStatus = "9152604461510864"
+
 // SetStatusMessage updates the current user's status text, which is shown in the "About" section in the user profile.
 //
 // This is different from the ephemeral status broadcast messages. Use SendMessage to types.StatusBroadcastJID to send
 // such messages.
-func (cli *Client) SetStatusMessage(ctx context.Context, msg string) error {
-	_, err := cli.sendIQ(ctx, infoQuery{
-		Namespace: "status",
-		Type:      iqSet,
-		To:        types.ServerJID,
-		Content: []waBinary.Node{{
-			Tag:     "status",
-			Content: msg,
-		}},
+func (cli *Client) SetStatusMessage(ctx context.Context, status types.SetStatusInput) error {
+	_, err := cli.sendMexIQ(ctx, mutationUpdateTextStatus, map[string]any{
+		"input": &status,
 	})
+	// TODO check output result?
 	return err
 }
 
@@ -958,10 +955,12 @@ func (cli *Client) usync(ctx context.Context, jids []types.JID, mode, context st
 	}
 }
 
-func (cli *Client) parseBlocklist(node *waBinary.Node) *types.Blocklist {
+func (cli *Client) parseBlocklist(node *waBinary.Node) (*types.Blocklist, []store.LIDMapping) {
 	output := &types.Blocklist{
-		DHash: node.AttrGetter().String("dhash"),
+		DHash:          node.AttrGetter().String("dhash"),
+		AddressingMode: types.AddressingMode(node.AttrGetter().String("addressing_mode")),
 	}
+	var lidMappings []store.LIDMapping
 	for _, child := range node.GetChildren() {
 		ag := child.AttrGetter()
 		blockedJID := ag.JID("jid")
@@ -970,40 +969,110 @@ func (cli *Client) parseBlocklist(node *waBinary.Node) *types.Blocklist {
 			continue
 		}
 
-		output.JIDs = append(output.JIDs, blockedJID)
+		item := types.BlocklistItem{
+			LID:    blockedJID,
+			PN:     ag.OptionalJIDOrEmpty("pn_jid"),
+			Active: ag.OptionalBool("active"),
+		}
+		output.Items = append(output.Items, item)
+		if item.Active && item.LID.Server == types.HiddenUserServer && item.PN.Server == types.DefaultUserServer {
+			lidMappings = append(lidMappings, store.LIDMapping{PN: item.PN, LID: item.LID})
+		}
 	}
-	return output
+	return output, lidMappings
 }
 
 // GetBlocklist gets the list of users that this user has blocked.
-func (cli *Client) GetBlocklist(ctx context.Context) (*types.Blocklist, error) {
+//
+// If a dhash is provided, and it matches the server value, then no blocklist will be returned.
+func (cli *Client) GetBlocklist(ctx context.Context, dhash string) (*types.Blocklist, error) {
+	var content []waBinary.Node
+	if dhash != "" {
+		content = []waBinary.Node{{
+			Tag: "item",
+			Attrs: waBinary.Attrs{
+				"dhash": dhash,
+			},
+		}}
+	}
 	resp, err := cli.sendIQ(ctx, infoQuery{
 		Namespace: "blocklist",
 		Type:      iqGet,
 		To:        types.ServerJID,
+		Content:   content,
 	})
 	if err != nil {
 		return nil, err
 	}
 	list, ok := resp.GetOptionalChildByTag("list")
 	if !ok {
+		if dhash != "" {
+			return nil, nil
+		}
 		return nil, &ElementMissingError{Tag: "list", In: "response to blocklist query"}
 	}
-	return cli.parseBlocklist(&list), nil
+	blocklist, mappings := cli.parseBlocklist(&list)
+	if len(mappings) > 0 {
+		err = cli.Store.LIDs.PutManyLIDMappings(ctx, mappings)
+		if err != nil {
+			cli.Log.Errorf("Failed to store LID mappings from blocklist query: %v", err)
+		}
+	}
+	return blocklist, nil
 }
 
 // UpdateBlocklist updates the user's block list and returns the updated list.
-func (cli *Client) UpdateBlocklist(ctx context.Context, jid types.JID, action events.BlocklistChangeAction) (*types.Blocklist, error) {
+//
+// If a dhash is provided, and it matches the server value, then an updated blocklist will not be returned.
+func (cli *Client) UpdateBlocklist(ctx context.Context, jid types.JID, action events.BlocklistChangeAction, dhash string) (*types.Blocklist, error) {
+	var lidJID, pnJID types.JID
+
+	if jid.Server == types.DefaultUserServer {
+		pnJID = jid
+		lid, err := cli.Store.LIDs.GetLIDForPN(ctx, jid)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get LID for PN %s: %w", jid, err)
+		}
+		if lid.IsEmpty() {
+			info, err := cli.GetUserInfo(ctx, []types.JID{jid})
+			if err != nil {
+				return nil, fmt.Errorf("failed to get user info for %s to fill LID cache: %w", jid, err)
+			}
+			lid = info[jid].LID
+			if lid.IsEmpty() {
+				return nil, fmt.Errorf("%w: no LID found for %s from server", ErrRecipientNotOnWhatsApp, jid)
+			}
+		}
+		lidJID = lid
+	} else if jid.Server == types.HiddenUserServer {
+		lidJID = jid
+		if action == events.BlocklistChangeActionBlock {
+			pn, err := cli.Store.LIDs.GetPNForLID(ctx, jid)
+			if err != nil {
+				return nil, fmt.Errorf("failed to resolve PN for %s: %w", jid, err)
+			}
+			pnJID = pn
+		}
+	}
+
+	itemAttrs := waBinary.Attrs{
+		"jid":    lidJID,
+		"action": string(action),
+	}
+	if action == events.BlocklistChangeActionBlock && !pnJID.IsEmpty() {
+		itemAttrs["pn_jid"] = pnJID
+	}
+	if dhash != "" {
+		itemAttrs["dhash"] = dhash
+	}
+
 	resp, err := cli.sendIQ(ctx, infoQuery{
 		Namespace: "blocklist",
 		Type:      iqSet,
 		To:        types.ServerJID,
 		Content: []waBinary.Node{{
-			Tag: "item",
-			Attrs: waBinary.Attrs{
-				"jid":    jid,
-				"action": string(action),
-			},
+			Tag:   "item",
+			Attrs: itemAttrs,
 		}},
 	})
 	if err != nil {
@@ -1013,5 +1082,9 @@ func (cli *Client) UpdateBlocklist(ctx context.Context, jid types.JID, action ev
 	if !ok {
 		return nil, &ElementMissingError{Tag: "list", In: "response to blocklist update"}
 	}
-	return cli.parseBlocklist(&list), err
+	if dhash != "" && list.AttrGetter().Bool("matched") {
+		return nil, nil
+	}
+	blocklist, _ := cli.parseBlocklist(&list)
+	return blocklist, err
 }

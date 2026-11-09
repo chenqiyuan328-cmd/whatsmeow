@@ -15,12 +15,12 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exslices"
-	"go.mau.fi/util/ptr"
 
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waServerSync"
+	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -45,6 +45,9 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 	}
 	cli.appStateSyncLock.Lock()
 	defer cli.appStateSyncLock.Unlock()
+	if until := cli.appStateBackoff[name]; time.Now().Before(until) {
+		return nil, fmt.Errorf("%w: not fetching %s until %s", ErrAppStateRateLimited, name, until.Format(time.RFC3339))
+	}
 	if fullSync {
 		err := cli.Store.AppState.DeleteAppStateVersion(ctx, string(name))
 		if err != nil {
@@ -72,7 +75,16 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 	}
 	for hasMore {
 		patches, err := cli.fetchAppStatePatches(ctx, name, state.Version, wantSnapshot)
+		var iqErr *IQError
+		if errors.As(err, &iqErr) && iqErr.Code == 429 && iqErr.ErrorNode != nil {
+			if backoff := iqErr.ErrorNode.AttrGetter().OptionalInt("backoff"); backoff > 0 {
+				cli.appStateBackoff[name] = time.Now().Add(time.Duration(backoff) * time.Second)
+			}
+		}
 		if err != nil {
+			if fullSync && ctx.Err() == nil && cli.BackgroundEventCtx.Err() == nil {
+				cli.dispatchEvent(&events.AppStateSyncError{Name: name, FullSync: fullSync, Error: err})
+			}
 			return nil, fmt.Errorf("failed to fetch app state %s patches: %w", name, err)
 		} else if !wantSnapshot && patches.Snapshot != nil {
 			return nil, fmt.Errorf("server unexpectedly returned snapshot for %s without asking", name)
@@ -248,7 +260,8 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		return
 	}
 
-	if mutation.Operation != waServerSync.SyncdMutation_SET {
+	isContactRemove := mutation.Operation == waServerSync.SyncdMutation_REMOVE && mutation.Index[0] == appstate.IndexContact
+	if mutation.Operation != waServerSync.SyncdMutation_SET && !isContactRemove {
 		return
 	}
 
@@ -288,6 +301,9 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		}
 	case appstate.IndexContact:
 		act := mutation.Action.GetContactAction()
+		if isContactRemove {
+			act = nil
+		}
 		eventToDispatch = &events.Contact{JID: jid, Timestamp: ts, Action: act, FromFullSync: fullSync}
 		if cli.Store.Contacts != nil {
 			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName())
@@ -416,6 +432,38 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 			MessageID:    mutation.Index[3],
 			Action:       act,
 			FromFullSync: fullSync,
+		}
+	case appstate.IndexWasaRootSecretAction:
+		if len(mutation.Index) < 2 {
+			return
+		}
+		botJID, _ := types.ParseJID(mutation.Index[1])
+		ownLID := cli.getOwnLID()
+		inputSecrets := mutation.Action.GetWasaRootSecretAction().GetSecrets()
+		ids := make([]string, 0, len(inputSecrets))
+		storeUpdateError = cli.Store.MsgSecrets.PutMessageSecrets(ctx, exslices.CastFunc(inputSecrets, func(secret *waSyncAction.WASARootSecretAction_RootSecretEntry) store.MessageSecretInsert {
+			ids = append(ids, secret.GetID())
+			return store.MessageSecretInsert{
+				Chat:   botJID,
+				Sender: ownLID,
+				ID:     secret.GetID(),
+				Secret: secret.GetRootSecret(),
+			}
+		}))
+		if storeUpdateError == nil && cli.Store.ChatSettings != nil {
+			var active *waSyncAction.WASARootSecretAction_RootSecretEntry
+			for _, secret := range inputSecrets {
+				if secret.GetStatus() == waSyncAction.WASARootSecretAction_RootSecretEntry_ACTIVE && (active == nil || secret.GetEpoch() > active.GetEpoch()) {
+					active = secret
+				}
+			}
+			storeUpdateError = cli.Store.ChatSettings.PutWASARootSecretID(ctx, botJID, types.MessageID(active.GetID()))
+		}
+		if storeUpdateError == nil {
+			zerolog.Ctx(ctx).Debug().
+				Strs("ids", ids).
+				Stringer("bot_jid", botJID).
+				Msg("Stored WASA root secrets from app state")
 		}
 	}
 	if storeUpdateError != nil {
@@ -575,7 +623,7 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 			patches, err := appstate.ParsePatchList(ctx, &respCollection, cli.downloadExternalAppStateBlob)
 			if err != nil {
 				return fmt.Errorf("%w (also, parsing patches in the response failed: %w)", mainErr, err)
-			} else if state, err = cli.applyAppStatePatches(ctx, patch.Type, state, patches, false, &eventsToDispatch); err != nil {
+			} else if _, err = cli.applyAppStatePatches(ctx, patch.Type, state, patches, false, &eventsToDispatch); err != nil {
 				return fmt.Errorf("%w (also, applying patches in the response failed: %w)", mainErr, err)
 			} else {
 				zerolog.Ctx(ctx).Debug().Msg("Retrying app state send after applying conflicting patches")
@@ -629,7 +677,7 @@ func BuildFatalAppStateExceptionNotification(collections ...appstate.WAPatchName
 			Type: waE2E.ProtocolMessage_APP_STATE_FATAL_EXCEPTION_NOTIFICATION.Enum(),
 			AppStateFatalExceptionNotification: &waE2E.AppStateFatalExceptionNotification{
 				CollectionNames: exslices.CastToString[string](collections),
-				Timestamp:       ptr.Ptr(time.Now().UnixMilli()),
+				Timestamp:       new(time.Now().UnixMilli()),
 			},
 		},
 	}
@@ -648,7 +696,7 @@ func BuildAppStateRecoveryRequest(collection appstate.WAPatchName) *waE2E.Messag
 				PeerDataOperationRequestType: waE2E.PeerDataOperationRequestType_COMPANION_SYNCD_SNAPSHOT_FATAL_RECOVERY.Enum(),
 				SyncdCollectionFatalRecoveryRequest: &waE2E.PeerDataOperationRequestMessage_SyncDCollectionFatalRecoveryRequest{
 					CollectionName: (*string)(&collection),
-					Timestamp:      ptr.Ptr(time.Now().Unix()),
+					Timestamp:      new(time.Now().Unix()),
 				},
 			},
 		},
